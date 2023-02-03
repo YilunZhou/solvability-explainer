@@ -451,10 +451,10 @@ class ImageSegmentationMasker(ImageMasker):
     def render_text(self, x, exp, label, func_val, execute, **kwargs):
         msg = (f'Explained label: {label}\n'
                f'Function value for label {label}: {func_val:0.3f}\n'
-               f'Grid cell feature attribution:\n')
-        data = [['Cell idx', 'Attr val']]
+               f'Superpixel feature attribution:\n')
+        data = [['Superpixel idx', 'Attr val']]
         for i, e in enumerate(exp):
-            data.append([f'Cell {i}', f'{e}'])
+            data.append([f'Superpixel {i}', f'{e}'])
         msg += tabulate(data, headers='firstrow', tablefmt='psql')
         if execute:
             print(msg)
