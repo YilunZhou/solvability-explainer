@@ -1,4 +1,6 @@
 
+from .explainer import Explanation
+
 from copy import deepcopy as copy
 from textwrap import wrap
 from functools import lru_cache
