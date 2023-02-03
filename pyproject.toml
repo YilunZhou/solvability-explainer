@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "solvex"
+version = "1.0.0"
+authors = [
+  { name="Yilun Zhou", email="yilun@csail.mit.edu" },
+]
+description = "Solvability-Based Explainer"
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence", 
+    "Intended Audience :: Science/Research", 
+    "Development Status :: 5 - Production/Stable",
+]
+dependencies = [
+    "tqdm",
+    "tabulate",
+    "numpy",
+    "matplotlib",
+    "Pillow",
+    "spacy",
+]
+
+[project.urls]
+"Homepage" = "https://yilunzhou.github.io/solvability/"
+"Bug Tracker" = "https://github.com/yilunzhou/solvability-explainer/issues"
