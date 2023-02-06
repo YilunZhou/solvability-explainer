@@ -10,6 +10,7 @@ from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
+import torch
 
 def get_cmap(kwargs):
     pos_color = np.array(kwargs.get('pos_color', (232, 119, 93)))
@@ -29,7 +30,7 @@ class Masker():
     def get_num_features(self, x, **kwargs):
         raise NotImplementedError()
 
-class TabularMasker():
+class TabularMasker(Masker):
     def __init__(self, suppression, dataset=None):
         if dataset is not None:
             dataset = np.array(dataset)
@@ -118,7 +119,7 @@ class TabularMasker():
         else:
             return fig
 
-class TextWordMasker():
+class TextWordMasker(Masker):
     def __init__(self, suppression):
         assert suppression == 'remove' or suppression.startswith('replace-')
         if suppression.startswith('replace-'):
@@ -207,7 +208,7 @@ class TextWordMasker():
         else:
             return fig
 
-class TextSentenceMasker():
+class TextSentenceMasker(Masker):
     def __init__(self):
         import spacy
         spacy.prefer_gpu()
@@ -302,7 +303,7 @@ class TextSentenceMasker():
         else:
             return fig
 
-class ImageMasker():
+class ImageMasker(Masker):
     def __init__(self, fill_value='global_mean'):
         if fill_value is None:
             fill_value = 'global_mean'
@@ -311,6 +312,26 @@ class ImageMasker():
         assert fill_value in ['global_mean', 'local_mean'] or \
             len(fill_value) == 3
         self.fill_value = fill_value
+
+    def get_img_size(self, x):
+        if isinstance(x, Image.Image):
+            w, h = x.size
+        elif isinstance(x, np.ndarray):
+            h, w, _ = x.shape
+        else:
+            _, h, w = x.shape
+        return h, w
+
+    def copy_img(self, x):
+        if isinstance(x, (Image.Image, np.ndarray)):
+            if isinstance(x, Image.Image):
+                return np.asarray(x.convert('RGB'))
+            else:
+                return x.copy()
+            assert x.shape[2] == 3
+        else:
+            assert x.shape[0] == 3
+            return x.clone()
 
     def insert_assigned(self, x, e, **kwargs):
         return self.erase(x, e, 'absent', **kwargs)
@@ -335,12 +356,13 @@ class ImageGridMasker(ImageMasker):
             resolution = [resolution, resolution]
         assert len(resolution) == 2
         self.resolution = resolution
+        self.fill_value_cache = [None, None]
 
     def get_regions(self, h, w, e, which):
         assert which in ['present', 'absent']
         hs = np.linspace(0, h, self.resolution[0] + 1).astype('int32')
         ws = np.linspace(0, w, self.resolution[1] + 1).astype('int32')
-        regions = []
+        regions = dict()
         if which == 'present':
             fea_idxs = e.fea2imp.keys()
         else:
@@ -348,27 +370,55 @@ class ImageGridMasker(ImageMasker):
         for fea_idx in fea_idxs:
             h_idx = fea_idx // self.resolution[1]
             w_idx = fea_idx % self.resolution[1]
-            regions.append((hs[h_idx], hs[h_idx + 1], ws[w_idx], ws[w_idx + 1]))
+            regions[fea_idx] = (hs[h_idx], hs[h_idx + 1], ws[w_idx], ws[w_idx + 1])
         return regions
 
-    def erase(self, x, e, which):
-        assert isinstance(x, Image.Image)
-        x = np.asarray(x.convert('RGB'))
-        assert x.shape[2] == 3
-        h, w, _ = x.shape
-        regions = self.get_regions(h, w, e, which)
-        if self.fill_value == 'local_mean':
-            for h1, h2, w1, w2 in regions:
-                val = x[h1:h2, w1:w2].mean(axis=(0, 1))
-                x[h1:h2, w1:w2] = val
+    def resolve_fill_value(self, x):
+        if self.fill_value_cache[0] is x:
+            return self.fill_value_cache[1]
+        old_x = x
+        L = self.get_num_features(x)
+        if isinstance(x, Image.Image):
+            x = np.asarray(x.convert('RGB'))
+        if isinstance(x, torch.Tensor):
+            x = x.permute(1, 2, 0)
+        if self.fill_value == 'global_mean':
+            m = x.mean(axis=(0, 1))
+            fv = lambda _: m
+        elif self.fill_value == 'local_mean':
+            fv_dict = dict()
+            h, w, _ = x.shape
+            regions = self.get_regions(h, w, Explanation.empty(L), 'absent')
+            for i, (h1, h2, w1, w2) in regions.items():
+                fv_dict[i] = x[h1:h2, w1:w2].mean(axis=(0, 1))
+            fv = lambda i: fv_dict[i]
         else:
-            if self.fill_value == 'global_mean':
-                val = x.mean(axis=(0, 1))
+            if isinstance(self.fill_value, numbers.Number):
+                a = np.array([self.fill_value] * 3)
             else:
-                val = self.fill_value
-            for h1, h2, w1, w2 in regions:
-                x[h1:h2, w1:w2] = val
-        return Image.fromarray(x)
+                a = np.array(self.fill_value)
+            if isinstance(x, torch.Tensor):
+                a = torch.tensor(a).to(x.device)
+            fv = lambda _: a
+        self.fill_value_cache = [old_x, fv]
+        return fv
+
+    def erase(self, x, e, which):
+        fv = self.resolve_fill_value(x)
+        assert isinstance(x, (Image.Image, np.ndarray, torch.Tensor))
+        x_cp = self.copy_img(x)
+        if isinstance(x, torch.Tensor):
+            x_cp = x_cp.permute(1, 2, 0)
+        h, w = self.get_img_size(x)
+        regions = self.get_regions(h, w, e, which)
+        for i, (h1, h2, w1, w2) in regions.items():
+            x_cp[h1:h2, w1:w2] = fv(i)
+        if isinstance(x, Image.Image):
+            return Image.fromarray(x_cp)
+        elif isinstance(x, np.ndarray):
+            return x_cp
+        else:
+            return x_cp.permute(2, 0, 1)
 
     def get_num_features(self, x):
         return self.resolution[0] * self.resolution[1]
@@ -376,8 +426,9 @@ class ImageGridMasker(ImageMasker):
     def get_saliency_map(self, h, w, exp):
         regions = self.get_regions(h, w, Explanation.empty(len(exp)), 'absent')
         saliency_map = np.zeros((h, w))
-        for i, (h1, h2, w1, w2) in enumerate(regions):
+        for i, (h1, h2, w1, w2) in regions.items():
             saliency_map[h1:h2, w1:w2] = exp[i]
+        return saliency_map
 
     def render_text(self, x, exp, label, func_val, execute, **kwargs):
         msg = (f'Explained label: {label}\n'
@@ -394,7 +445,7 @@ class ImageGridMasker(ImageMasker):
             return msg
 
     def render_color(self, x, exp, label, func_val, execute, **kwargs):
-        w, h = x.size
+        h, w = self.get_img_size(x)
         if 'fig' not in kwargs:
             figsize = kwargs.get('figsize', (7, 4))
             fig = plt.figure(figsize=figsize)
@@ -402,10 +453,12 @@ class ImageGridMasker(ImageMasker):
             fig = kwargs['fig']
             plt.figure(fig.number)
         lim = abs(exp).max()
-        regions = self.get_regions(h, w, Explanation.empty(len(exp)), 'absent')
-        saliency_map = np.zeros((h, w))
-        for i, (h1, h2, w1, w2) in enumerate(regions):
-            saliency_map[h1:h2, w1:w2] = exp[i]
+        saliency_map = self.get_saliency_map(h, w, exp)
+        if isinstance(x, torch.Tensor):
+            if 'orig_img' not in kwargs:
+                print('Original image not provided.')
+            else: 
+                x = kwargs['orig_img']
         plt.imshow(x, cmap='gray')
         cm = get_cmap(kwargs)
         plt.imshow(saliency_map, vmin=-lim, vmax=lim, cmap=cm, alpha=0.8)
@@ -421,29 +474,62 @@ class ImageGridMasker(ImageMasker):
 class ImageSegmentationMasker(ImageMasker):
     def __init__(self, fill_value=None):
         super().__init__(fill_value)
+        self.fill_value_cache = [None, None, None]
+
+    def resolve_fill_value(self, x, seg_mask):
+        if self.fill_value == 'local_mean':
+            if self.fill_value_cache[0] is x and self.fill_value_cache[1] is seg_mask:
+                return self.fill_value_cache[2]
+        else:
+            if self.fill_value_cache[0] is x:
+                return self.fill_value_cache[2]
+        old_x = x
+        L = self.get_num_features(x, seg_mask)
+        if isinstance(x, Image.Image):
+            x = np.asarray(x.convert('RGB'))
+        elif isinstance(x, torch.Tensor):
+            x = x.permute(1, 2, 0)
+        if self.fill_value == 'global_mean':
+            m = x.mean(axis=(0, 1))
+            fv = lambda _: m
+        elif self.fill_value == 'local_mean':
+            fv_dict = dict()
+            for fea_idx in range(L):
+                val = x[seg_mask == fea_idx].mean(axis=0)
+                fv_dict[fea_idx] = val
+            fv = lambda i: fv_dict[i]
+        else:
+            if isinstance(self.fill_value, numbers.Number):
+                a = np.array([self.fill_value] * 3)
+            else:
+                a = np.array(self.fill_value)
+            if isinstance(x, torch.Tensor):
+                a = torch.tensor(a).float().to(x.device)
+            fv = lambda _: a
+        if self.fill_value == 'local_mean':
+            self.fill_value_cache = [old_x, seg_mask, fv]
+        else:
+            self.fill_value_cache = [old_x, None, fv]
+        return fv
 
     def erase(self, x, e, which, seg_mask):
-        assert which in ['present', 'absent']
-        assert isinstance(x, Image.Image)
-        x = np.asarray(x.convert('RGB'))
-        assert x.shape[2] == 3
-        h, w, _ = x.shape
+        fv = self.resolve_fill_value(x, seg_mask)
+        assert isinstance(x, (Image.Image, np.ndarray, torch.Tensor))
+        x_cp = self.copy_img(x)
+        if isinstance(x, torch.Tensor):
+            x_cp = x_cp.permute(1, 2, 0)
         if which == 'present':
             fea_idxs = e.fea2imp.keys()
         else:
             fea_idxs = e.unused
-        if self.fill_value == 'local_mean':
-            for fea_idx in fea_idxs:
-                val = x[seg_mask == fill_value].mean(axis=0)
-                x[seg_mask == fill_value] = val
+        for fea_idx in fea_idxs:
+            x_cp[seg_mask == fea_idx] = fv(fea_idx)
+        if isinstance(x, Image.Image):
+            return Image.fromarray(x_cp)
+        elif isinstance(x, np.ndarray):
+            return x_cp
         else:
-            if self.fill_value == 'global_mean':
-                val = x.mean(axis=(0, 1))
-            else:
-                val = self.fill_value
-            for fea_idx in fea_idxs:
-                x[seg_mask == fea_idx] = val
-        return Image.fromarray(x)
+            return x_cp.permute(2, 0, 1)
 
     def get_num_features(self, x, seg_mask):
         return seg_mask.max() + 1
@@ -464,7 +550,7 @@ class ImageSegmentationMasker(ImageMasker):
     def render_color(self, x, exp, label, func_val, execute, **kwargs):
         assert 'seg_mask' in kwargs
         seg_mask = kwargs['seg_mask']
-        w, h = x.size
+        h, w = self.get_img_size(x)
         if 'fig' not in kwargs:
             figsize = kwargs.get('figsize', (7, 4))
             fig = plt.figure(figsize=figsize)
@@ -475,6 +561,11 @@ class ImageSegmentationMasker(ImageMasker):
         saliency_map = np.zeros((h, w))
         for i, e in enumerate(exp):
             saliency_map[seg_mask == i] = e
+        if isinstance(x, torch.Tensor):
+            if 'orig_img' not in kwargs:
+                print('Original image not provided.')
+            else: 
+                x = kwargs['orig_img']
         plt.imshow(x, cmap='gray')
         cm = get_cmap(kwargs)
         plt.imshow(saliency_map, vmin=-lim, vmax=lim, cmap=cm, alpha=0.8)

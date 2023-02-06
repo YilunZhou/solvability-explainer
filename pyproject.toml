@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "solvex"
-version = "1.0.2"
+version = "1.0.3"
 authors = [
   { name="Yilun Zhou", email="yilun@csail.mit.edu" },
 ]
@@ -25,6 +25,7 @@ dependencies = [
     "numpy",
     "matplotlib",
     "Pillow",
+    "torch",
     "spacy",
 ]
 
